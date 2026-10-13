@@ -23,7 +23,12 @@ How to run (after implementing):
 from __future__ import annotations
 
 import argparse
+import gc
+import logging
+import time
+import tracemalloc
 from collections import Counter
+from datetime import date
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
@@ -44,14 +49,21 @@ class ExecutionTimer:
         self._start: Optional[float] = None
 
     def __enter__(self) -> "ExecutionTimer":
-        # TODO: record start time (recommend time.perf_counter)
-        raise NotImplementedError
+        self._start = time.perf_counter()
+        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
-        # TODO: print elapsed time
-        # TODO: if exc_type is not None, log exception details
-        # TODO: return False to propagate exceptions
-        raise NotImplementedError
+        elapsed = time.perf_counter() - self._start
+        print(f"{self.label}: {elapsed:.6f} seconds")
+        if exc_type is not None:
+            logging.error(
+                "%s failed: %s: %s",
+                self.label,
+                exc_type.__name__,
+                exc_val,
+                exc_info=(exc_type, exc_val, exc_tb),
+            )
+        return False
 
 
 def read_lines(path: str | Path) -> Iterator[str]:
@@ -63,8 +75,9 @@ def read_lines(path: str | Path) -> Iterator[str]:
     - Does NOT use readlines()
     - Does NOT load entire file into memory
     """
-    # TODO: implement
-    raise NotImplementedError
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            yield line.strip()
 
 
 def filter_errors(lines: Iterable[str]) -> Iterator[str]:
@@ -73,8 +86,9 @@ def filter_errors(lines: Iterable[str]) -> Iterator[str]:
 
     Accepts any iterable of strings and remains lazy.
     """
-    # TODO: implement
-    raise NotImplementedError
+    for line in lines:
+        if "ERROR" in line:
+            yield line
 
 
 def parse_line(line: str) -> Dict[str, str]:
@@ -89,8 +103,17 @@ def parse_line(line: str) -> Dict[str, str]:
     - Message may contain spaces
     - If malformed, raise ValueError
     """
-    # Hint: line.split(maxsplit=2)
-    raise NotImplementedError
+    parts = line.split(maxsplit=2)
+    if len(parts) != 3 or not parts[2].strip():
+        raise ValueError(f"Malformed log line: {line!r}")
+    level, log_date, message = parts
+    try:
+        parsed_date = date.fromisoformat(log_date)
+    except ValueError as exc:
+        raise ValueError(f"Malformed log date: {log_date!r}") from exc
+    if parsed_date.isoformat() != log_date:
+        raise ValueError(f"Expected YYYY-MM-DD date: {log_date!r}")
+    return {"level": level, "date": log_date, "message": message}
 
 
 def parse_lines(lines: Iterable[str]) -> Iterator[Dict[str, str]]:
@@ -98,13 +121,51 @@ def parse_lines(lines: Iterable[str]) -> Iterator[Dict[str, str]]:
     TODO: Lazy parse stage: yields structured records as dictionaries:
         {"level": "...", "date": "...", "message": "..."}
     """
-    # TODO: implement
-    raise NotImplementedError
+    for line in lines:
+        yield parse_line(line)
 
 
 def build_pipeline(path: str | Path) -> Iterator[Dict[str, str]]:
-    """Compose the required lazy pipeline (do NOT materialize lists)."""
+    """Version A: chain lazy generators without materializing lists."""
     return parse_lines(filter_errors(read_lines(path)))
+
+
+def build_pipeline_eager(path: str | Path) -> List[Dict[str, str]]:
+    """Version B: intentionally waste memory by materializing every stage.
+
+    This comparison violates the lab's streaming design constraint and should
+    not be used as the normal pipeline.
+    """
+    lines = list(read_lines(path))
+    errors = list(filter_errors(lines))
+    records = list(parse_lines(errors))
+    return records
+
+
+def compare_pipeline_memory(path: str | Path) -> Dict[str, int]:
+    """Measure peak Python allocations for construction AND full consumption.
+
+    Each version gets a separate tracing session; sample generation is excluded.
+    Results are approximate allocation peaks, not whole-process resident memory.
+    """
+    if tracemalloc.is_tracing():
+        raise RuntimeError("Memory comparison requires its own tracemalloc session")
+    peaks: Dict[str, int] = {}
+    expected_summary = None
+    for name, builder in [("lazy", build_pipeline), ("eager", build_pipeline_eager)]:
+        gc.collect()
+        tracemalloc.start()
+        try:
+            summary = summarize_errors(builder(path))
+            _, peaks[name] = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        if expected_summary is None:
+            expected_summary = summary
+        elif summary != expected_summary:
+            raise AssertionError("Lazy and eager summaries differ")
+        del summary
+    return peaks
 
 
 def summarize_errors(records: Iterable[Dict[str, str]]) -> Tuple[int, List[str], Counter]:
@@ -157,6 +218,10 @@ def main() -> int:
     parser.add_argument("--preview", type=int, default=0, help="Print first N parsed ERROR records.")
     parser.add_argument("--generate-sample", action="store_true", help="Generate a sample app.log file.")
     parser.add_argument("--repeat", type=int, default=1000, help="Repeat count for sample generation.")
+    parser.add_argument(
+        "--compare-memory", action="store_true",
+        help="Compare peak Python memory for lazy and eager pipelines on the same log.",
+    )
     args = parser.parse_args()
 
     path = Path(args.path)
@@ -168,6 +233,18 @@ def main() -> int:
         print(f"ERROR: File not found: {path}")
         print("Tip: run with --generate-sample to create one.")
         return 2
+
+    if args.compare_memory:
+        peaks = compare_pipeline_memory(path)
+        mib = 1024 * 1024
+        print("Peak traced Python allocations (approximate; full pipeline and summary):")
+        print(f"Version A (lazy):  {peaks['lazy'] / mib:.3f} MiB")
+        print(f"Version B (eager): {peaks['eager'] / mib:.3f} MiB")
+        print(f"Extra eager memory: {(peaks['eager'] - peaks['lazy']) / mib:.3f} MiB")
+        if peaks['lazy']:
+            print(f"Eager/lazy peak ratio: {peaks['eager'] / peaks['lazy']:.1f}x")
+        print("Both versions produced identical summaries.")
+        return 0
 
     # Run the pipeline with a timer (once implemented)
     with ExecutionTimer("Pipeline run"):
